@@ -23,10 +23,23 @@
 //  HARDWARE
 // ═══════════════════════════════════════════════════════
 #define LED_PIN       16
-#define NUM_LEDS      7
 #define BUTTON_PIN    14
 #define LDR_PIN       34
-#define BADGE_TYPE    0       // 0 = cuore, 1 = sole
+
+// ── TIPO DI BADGE: imposta QUI quale stai programmando ──
+#define BADGE_CUORE   0
+#define BADGE_SOLE    1
+#define BADGE_FUNGO   2       // badge di test/debug (7 LED)
+#define BADGE_TYPE    BADGE_FUNGO
+
+#if   BADGE_TYPE == BADGE_CUORE
+  #define NUM_LEDS    22
+#elif BADGE_TYPE == BADGE_SOLE
+  #define NUM_LEDS    22
+#else
+  #define NUM_LEDS    7        // FUNGO (test)
+#endif
+
 #define IS_CREATOR    0      // 1 SOLO sul TUO badge (il creatore). Gli altri 0.
 #define CREATOR_HUE   38      // tonalita' ORO della "firma" del creatore (FastLED hue)
 
@@ -49,25 +62,44 @@ static const float   EMA_ALPHA  = 0.3f;
 // ═══════════════════════════════════════════════════════
 static const float   OMEGA          = 2.0f * PI / 1.2f; // periodo battito 1.2s
 static const float   K_COUPLING     = 6.0f;  // forza aggancio fasi (2K=12 > max Δω≈2.6)
-static const float   MOOD_SPEED[3]  = { 0.8f, 1.0f, 1.3f };
+static const float   MOOD_SPEED[3]  = { 0.4f, 1.0f, 1.3f };  // chill lento (respiro ~3s), social, party
 static const uint8_t MOOD_BRIGHT[3] = {  80,   170,  220 };  // valore FastLED max
-static const float   LED_SPREAD     = 1.0f;  // onda sui LED: 1.0 = un'onda intera sul giro
 // Quando due o piu' badge sono vicini battono ALLO STESSO RITMO COMUNE,
 // indipendente dal mood (Δω=0 → le fasi si agganciano a sfasamento ZERO).
 // Allontanandosi ciascuno torna al ritmo + luminosita' del proprio mood.
-static const float   TOGETHER_SPEED  = 1.0f;  // ritmo comune da vicini (pace "social")
-static const uint8_t TOGETHER_BRIGHT = 200;   // luminosita' comune da vicini
+static const float    TOGETHER_SPEED  = 1.0f; // ritmo comune da vicini (pace "social")
+static const uint8_t  TOGETHER_BRIGHT = 200;  // luminosita' comune da vicini
+static const uint32_t CHILL_BREATH_MS = 10000;// durata di un respiro completo in chill
+
+// ── MAPPA "SOCIAL": livello a cui si accende ogni LED (indice 0-based) ──
+// Riempimento secondo il cablaggio FISICO del badge; svuotamento al contrario.
+#if   BADGE_TYPE == BADGE_CUORE
+static const uint8_t  SOCIAL_LEVEL[NUM_LEDS] =
+  { 2,3,4,5,6,7,8,7,6,5,4,3,2,1,0,1,3,9,9,9,4,2 };
+static const uint8_t  SOCIAL_MAXLEVEL = 9;
+#elif BADGE_TYPE == BADGE_SOLE
+static const uint8_t  SOCIAL_LEVEL[NUM_LEDS] =
+  { 6,8,6,9,10,9,11,7,8,6,5,4,4,3,1,2,0,2,1,4,2,5 };
+static const uint8_t  SOCIAL_MAXLEVEL = 11;
+#else  // FUNGO (test)
+static const uint8_t  SOCIAL_LEVEL[NUM_LEDS] = { 0,1,1,0,1,1,2 };
+static const uint8_t  SOCIAL_MAXLEVEL = 2;
+#endif
+static const uint32_t SOCIAL_FILL_MS = 3000;  // riempimento+svuotamento completo
 
 // ═══════════════════════════════════════════════════════
 //  TIMING
 // ═══════════════════════════════════════════════════════
 static const uint32_t NB_TIMEOUT_MS     =   4000;
-static const uint32_t TRIBE_TIME_MS     =  30000;
+static const uint32_t TRIBE_TIME_MS     =   3000; // >2 badge per 3s → entra in TRIBE
+static const uint32_t GROUP_FUSION_MS   =  40000; // gruppo: fusione piena in ~40s
 static const uint32_t HB_INTERVAL_MS   = 600000; // heartbeat ogni 10 min
 static const uint32_t HB_DUR_MS        =   5000;
 static const uint32_t ADV_INTERVAL_MS  =    250;
 static const uint32_t NVS_SAVE_MS      =  30000;
-static const uint32_t MATURITY_FULL_MS =  30000; // contatto totale per maturità piena
+static const uint32_t MATURITY_FULL_MS = 1800000; // 30 MIN di vicinanza totale = fusione piena
+static const uint32_t FUSION_GRACE_MS  =   5000; // ad ogni avvicinamento: 5s prima di (ri)fondere
+static const uint32_t FUSION_RESUME_MS =   2000; // dissolvenza nel riprendere dalla soglia salvata
 static const uint32_t FAREWELL_DUR_MS  =   1500;
 static const uint32_t RECOG_DUR_MS     =    600;
 
@@ -86,6 +118,17 @@ struct __attribute__((packed)) BeaconPayload {
   uint8_t  phase;       // 0-255 → 0-2π
   uint32_t tConsensus;  // ms festival time
   uint16_t peopleMet;   // persone distinte conosciute (per le statistiche)
+  // ── GRAFO: 2 contatti a rotazione (ID + peso) per costruire la rete ──
+  uint8_t  cPage;       // indice pagina contatti che sto trasmettendo
+  uint8_t  cId[2][3];   // ID di 2 miei contatti (0,0,0 = slot vuoto)
+  uint8_t  cW[2];       // peso = tempo di contatto in unità da 4s (cap 255 = ~17min)
+};  // 25 byte: stanno in un beacon BLE (31 max)
+
+// ── Lista contatti del badge (per il grafo), persistente e trasmessa ──
+#define MAX_CONTACTS 100
+struct __attribute__((packed)) Contact {
+  uint8_t  id[3];       // ID del contatto
+  uint16_t secs;        // tempo di contatto cumulativo in secondi
 };
 
 #define MAX_NB 10
@@ -120,9 +163,16 @@ uint32_t t0Offset     = 0;
 Neighbor neighbors[MAX_NB];
 uint8_t  nbCount      = 0;
 
+Contact  contacts[MAX_CONTACTS];   // tutte le persone incontrate (per il grafo)
+uint8_t  contactCount = 0;
+uint8_t  contactPage  = 0;         // pagina corrente trasmessa nel beacon
+
 int8_t   partnerId    = -1;
-uint32_t tribeEnterMs = 0;
+uint32_t groupMs      = 0;   // da quanto il gruppo (>2 badge) è insieme → fusione gruppo
 uint32_t farewellStart= 0;
+
+uint32_t pairSessionMs   = 0;   // durata dell'avvicinamento in corso (per i 5s di rodaggio)
+uint32_t pairSessionHash = 0;   // con CHI e' la sessione (idHash); 0 = nessuna
 
 bool     recognitionPending = false;
 uint32_t recognitionStart   = 0;
@@ -179,6 +229,38 @@ uint8_t circularMeanHue(uint8_t* hues, uint8_t n) {
 }
 
 // ═══════════════════════════════════════════════════════
+//  LISTA CONTATTI (per il grafo)  —  chiamare con mutex preso
+// ═══════════════════════════════════════════════════════
+int findContactByHash(uint32_t h) {
+  uint8_t a = h >> 16, b = h >> 8, c = h;
+  for (uint8_t i = 0; i < contactCount; i++)
+    if (contacts[i].id[0] == a && contacts[i].id[1] == b && contacts[i].id[2] == c) return i;
+  return -1;
+}
+
+// Inserisce/aggiorna un contatto col suo peso (secondi). Tiene il valore piu' alto.
+void upsertContact(uint32_t h, uint32_t secs) {
+  if (secs > 65535UL) secs = 65535UL;
+  int idx = findContactByHash(h);
+  if (idx >= 0) {
+    if ((uint16_t)secs > contacts[idx].secs) contacts[idx].secs = (uint16_t)secs;
+    return;
+  }
+  if (contactCount < MAX_CONTACTS) {
+    idx = contactCount++;
+  } else {                                  // pieno: sostituisci il piu' debole
+    idx = 0;
+    for (uint8_t i = 1; i < contactCount; i++)
+      if (contacts[i].secs < contacts[idx].secs) idx = i;
+    if (contacts[idx].secs >= (uint16_t)secs) return;   // il nuovo non batte il minimo
+  }
+  contacts[idx].id[0] = h >> 16;
+  contacts[idx].id[1] = h >> 8;
+  contacts[idx].id[2] = h;
+  contacts[idx].secs  = (uint16_t)secs;
+}
+
+// ═══════════════════════════════════════════════════════
 //  NEIGHBOR TABLE
 // ═══════════════════════════════════════════════════════
 
@@ -202,16 +284,14 @@ int8_t findOrCreate(uint32_t hash) {
         slot   = i;
       }
     }
-    // salva NVS del vecchio
-    char key[9];
-    snprintf(key, sizeof(key), "%08lx", (unsigned long)neighbors[slot].idHash);
-    prefs.putUInt(key, neighbors[slot].totalContactMs);
+    // riversa il vecchio nella lista contatti (grafo + persistenza)
+    if (neighbors[slot].totalContactMs > 0)
+      upsertContact(neighbors[slot].idHash, neighbors[slot].totalContactMs / 1000);
   }
 
-  // carica totalContactMs del nuovo (se già incontrato in precedenza)
-  char key[9];
-  snprintf(key, sizeof(key), "%08lx", (unsigned long)hash);
-  uint32_t saved = prefs.getUInt(key, 0);
+  // carica il tempo gia' accumulato con questa persona (dalla lista contatti)
+  int ci = findContactByHash(hash);
+  uint32_t saved = (ci >= 0) ? (uint32_t)contacts[ci].secs * 1000UL : 0;
 
   neighbors[slot] = {
     .idHash       = hash,
@@ -288,6 +368,26 @@ void publishBeacon() {
   p.phase      = (uint8_t)(myPhase / (2.0f * PI) * 255.0f);
   p.tConsensus = festivalTime();
   p.peopleMet  = peopleMet;
+
+  // ── pagina contatti a rotazione (2 archi per beacon) per costruire il grafo ──
+  if (xSemaphoreTake(nbMutex, pdMS_TO_TICKS(3)) == pdTRUE) {
+    uint8_t nPages = (contactCount + 1) / 2;
+    if (nPages == 0) nPages = 1;
+    uint8_t pg = contactPage % nPages;
+    p.cPage = pg;
+    for (uint8_t k = 0; k < 2; k++) {
+      uint8_t ci = pg * 2 + k;
+      if (ci < contactCount) {
+        p.cId[k][0] = contacts[ci].id[0];
+        p.cId[k][1] = contacts[ci].id[1];
+        p.cId[k][2] = contacts[ci].id[2];
+        uint32_t q  = contacts[ci].secs / 4;       // peso in unità da 4s
+        p.cW[k]     = (q > 255) ? 255 : (uint8_t)q;
+      }
+    }
+    contactPage++;
+    xSemaphoreGive(nbMutex);
+  }
 
   NimBLEAdvertisementData data;
   data.setManufacturerData((const uint8_t*)&p, sizeof(p));   // NimBLE 2.x
@@ -382,6 +482,8 @@ void updateState(float dt) {
         peopleMet++;
         prefs.putUShort("met", peopleMet);
       }
+      // assicura che questo contatto sia nella lista del grafo da subito
+      upsertContact(neighbors[bestSlot].idHash, neighbors[bestSlot].totalContactMs / 1000);
       // ── SCINTILLA DEL CREATORE ──
       // se incontro il creatore (e non lo sono io), oppure se IO sono il creatore
       // e conosco qualcuno di nuovo → scintilla dorata su entrambi i badge.
@@ -412,18 +514,33 @@ void updateState(float dt) {
     }
   }
 
-  // Tribe: se ≥2 vicini a portata PAIRED per TRIBE_TIME_MS
+  // Gruppo (>2 badge): conta da quanto è insieme. Dopo TRIBE_TIME_MS entra in
+  // TRIBE; groupMs serve poi per la fusione di gruppo (~40s). Si azzera se il
+  // gruppo si rompe (scende a 2 badge o meno).
   if (myState == PAIRED && pairedGrade >= 2) {
-    if (tribeEnterMs == 0) tribeEnterMs = now;
-    if (now - tribeEnterMs >= TRIBE_TIME_MS) myState = TRIBE;
+    groupMs += (uint32_t)(dt * 1000.0f);
+    if (groupMs >= TRIBE_TIME_MS) myState = TRIBE;
   } else {
-    tribeEnterMs = 0;
+    groupMs = 0;
   }
 
-  // Accumulo contatto con il partner corrente
+  // ── Sessione d'incontro: ad OGNI avvicinamento la fusione riprende solo dopo
+  //    FUSION_GRACE_MS (5s); il livello riparte dalla soglia gia' raggiunta con
+  //    questa persona (totalContactMs e' persistente). Fusione piena a 30 min.
   if ((myState == PAIRED || myState == TRIBE) && partnerId >= 0) {
-    neighbors[partnerId].totalContactMs += (uint32_t)(dt * 1000.0f);
-  }
+    uint32_t h = neighbors[partnerId].idHash;
+    if (pairSessionHash != h) {        // nuovo avvicinamento con questa persona
+      pairSessionHash = h;
+      pairSessionMs   = 0;             // riparte il "rodaggio" di 5s
+    } else {
+      pairSessionMs += (uint32_t)(dt * 1000.0f);
+    }
+    if (pairSessionMs >= FUSION_GRACE_MS)   // dopo i 5s: accumula verso i 30 min
+      neighbors[partnerId].totalContactMs += (uint32_t)(dt * 1000.0f);
+  } else if (myState == IDLE || myState == SENSING) {
+    pairSessionHash = 0;               // separati → il prossimo incontro riparte dai 5s
+    pairSessionMs   = 0;
+  } // durante FAREWELL: si tiene la sessione (se si torna vicini non riparte il rodaggio)
 
   xSemaphoreGive(nbMutex);
 }
@@ -447,6 +564,7 @@ void renderLEDs() {
   bool    together = (myState == PAIRED || myState == TRIBE);
   uint8_t maxV     = together ? TOGETHER_BRIGHT : MOOD_BRIGHT[myMood];
   if (isNight) maxV /= 2;
+  uint8_t showBright = 255;   // brightness globale: il chill la abbassa per il dithering
 
   // Hue da mostrare + maturity
   uint8_t showHue  = myHue;
@@ -458,7 +576,11 @@ void renderLEDs() {
         (float)neighbors[partnerId].totalContactMs / (float)MATURITY_FULL_MS);
 
       if (myState == PAIRED) {
-        showHue = blendHue(myHue, neighbors[partnerId].hue, 0.5f * maturity);
+        // gate dei 5s: la fusione (ri)compare solo dopo il rodaggio, con una
+        // breve dissolvenza che riprende dalla soglia gia' raggiunta.
+        float act = constrain(((float)pairSessionMs - (float)FUSION_GRACE_MS)
+                              / (float)FUSION_RESUME_MS, 0.0f, 1.0f);
+        showHue = blendHue(myHue, neighbors[partnerId].hue, 0.5f * maturity * act);
       }
       else if (myState == TRIBE) {
         uint8_t tribeHues[MAX_NB + 1];
@@ -469,7 +591,10 @@ void renderLEDs() {
           if (neighbors[i].rssiFilt > RSSI_OUT)
             tribeHues[tn++] = neighbors[i].hue;
         }
-        showHue = circularMeanHue(tribeHues, tn);
+        // fusione di GRUPPO graduale: piena in ~40s (molto piu' veloce della
+        // coppia). A gMat=1 tutti mostrano la media → stesso colore condiviso.
+        float gMat = min(1.0f, (float)groupMs / (float)GROUP_FUSION_MS);
+        showHue = blendHue(myHue, circularMeanHue(tribeHues, tn), gMat);
       }
     }
     xSemaphoreGive(nbMutex);
@@ -493,12 +618,43 @@ void renderLEDs() {
   switch (myState) {
 
     case IDLE: {
-      // Onda allegra a bassa luminosità: ogni LED sfasato
-      uint8_t pv = maxV / 2;
-      for (int i = 0; i < NUM_LEDS; i++) {
-        float ledPh = myPhase + (float)i * LED_SPREAD * (2.0f * PI / (float)NUM_LEDS);
-        uint8_t v   = (uint8_t)((sinf(ledPh) * 0.5f + 0.5f) * pv);
-        leds[i] = CHSV(showHue, 255, v);
+      // Da SOLO: ogni mood ha la sua animazione "personale".
+      switch (myMood) {
+
+        case 0: {  // CHILL — respiro lento 10s. Colore pieno + luminosita' via
+                   // brightness GLOBALE: FastLED applica il dithering temporale
+                   // → niente scatti anche a luce bassa. Curva sin(ph/2): tocca
+                   // lo 0 e RISALE SUBITO (fondo a punta), cima morbida.
+          fill_solid(leds, NUM_LEDS, CHSV(myHue, 255, 255));
+          float   ph     = (float)(now % CHILL_BREATH_MS) / (float)CHILL_BREATH_MS * 2.0f * PI;
+          float   breath = sinf(ph * 0.5f);                 // 0 → 1 → 0, rimbalzo netto in basso
+          uint8_t lin    = (uint8_t)(breath * 255.0f);
+          showBright     = scale8(scale8(lin, lin), maxV);  // gamma ~2.0 + scala al max chill
+          break;
+        }
+
+        case 1: {  // SOCIAL — riempie i LED nell'ordine della mappa fisica del
+                   // badge, poi li svuota AL CONTRARIO (vedi SOCIAL_LEVEL[]).
+          float u     = (float)(now % SOCIAL_FILL_MS) / (float)SOCIAL_FILL_MS;
+          float tri   = 1.0f - fabsf(2.0f * u - 1.0f);          // 0 → 1 → 0
+          float front = tri * (float)(SOCIAL_MAXLEVEL + 1);     // fronte d'onda
+          for (int i = 0; i < NUM_LEDS; i++) {
+            float b = constrain(front - (float)SOCIAL_LEVEL[i], 0.0f, 1.0f);
+            leds[i] = CHSV(myHue, 255, (uint8_t)(b * maxV));
+          }
+          break;
+        }
+
+        default: {  // PARTY — arcobaleno che ruota veloce + scintillio, ignora myHue
+          uint8_t spin = (uint8_t)(now / 6);            // rotazione rapida dei colori
+          for (int i = 0; i < NUM_LEDS; i++) {
+            uint8_t h  = (uint8_t)(spin + i * 256 / NUM_LEDS);   // ogni LED un colore
+            uint8_t tw = sin8((uint8_t)(now + i * 36));          // lampeggio veloce sfasato
+            uint8_t v  = map(tw, 0, 255, maxV / 4, maxV);
+            leds[i] = CHSV(h, 255, v);
+          }
+          break;
+        }
       }
       break;
     }
@@ -598,6 +754,7 @@ void renderLEDs() {
     }
   }
 
+  FastLED.setBrightness(showBright);   // 255 per tutti gli stati; chill la modula (dithering)
   FastLED.show();
 }
 
@@ -657,14 +814,14 @@ namespace Btn {
 // ═══════════════════════════════════════════════════════
 void saveNVS() {
   if (xSemaphoreTake(nbMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
-  for (uint8_t i = 0; i < nbCount; i++) {
-    if (neighbors[i].totalContactMs == 0) continue;
-    char key[9];
-    snprintf(key, sizeof(key), "%08lx", (unsigned long)neighbors[i].idHash);
-    prefs.putUInt(key, neighbors[i].totalContactMs);
-  }
+  // riversa i vicini attivi nella lista contatti, poi salva la lista come blob
+  for (uint8_t i = 0; i < nbCount; i++)
+    if (neighbors[i].totalContactMs > 0)
+      upsertContact(neighbors[i].idHash, neighbors[i].totalContactMs / 1000);
+  prefs.putUChar("ncont", contactCount);
+  prefs.putBytes("contacts", contacts, (size_t)contactCount * sizeof(Contact));
   xSemaphoreGive(nbMutex);
-  Serial.println("[NVS] saved");
+  Serial.printf("[NVS] saved %u contatti\n", contactCount);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -692,11 +849,17 @@ void setup() {
   myHue   = prefs.getUChar("hue",  (uint8_t)random(0, 255));
   myMood  = prefs.getUChar("mood", 1);
   peopleMet = prefs.getUShort("met", 0);   // persone conosciute (persistente)
+  // lista contatti (grafo) salvata
+  contactCount = prefs.getUChar("ncont", 0);
+  if (contactCount > MAX_CONTACTS) contactCount = MAX_CONTACTS;
+  if (contactCount > 0)
+    prefs.getBytes("contacts", contacts, (size_t)contactCount * sizeof(Contact));
   myPhase = (float)(random(0, 628)) / 100.0f;  // fase iniziale casuale
 
-  Serial.printf("Badge %s type=%d hue=%d mood=%d\n",
-    BADGE_TYPE == 0 ? "CUORE" : "SOLE",
-    BADGE_TYPE, myHue, myMood);
+  const char* typeName = (BADGE_TYPE == BADGE_CUORE) ? "CUORE"
+                       : (BADGE_TYPE == BADGE_SOLE)  ? "SOLE" : "FUNGO";
+  Serial.printf("Badge %s type=%d NUM_LEDS=%d hue=%d mood=%d\n",
+    typeName, BADGE_TYPE, NUM_LEDS, myHue, myMood);
 
   // NimBLE
   NimBLEDevice::init("BADGE");
@@ -813,12 +976,18 @@ void loop() {
       while (dPh >  PI) dPh -= 2.0f * PI;
       while (dPh < -PI) dPh += 2.0f * PI;
       nbPh = fmodf(nbPh, 2.0f * PI); if (nbPh < 0) nbPh += 2.0f * PI;
-      Serial.printf("  → %08lx rssi=%d mat=%.0f%%  SYNC myPh=%.2f nbPh=%.2f dPh=%+.2f  FUSIONE %d+%d=%d",
+      bool fusing = (pairSessionMs >= FUSION_GRACE_MS);
+      Serial.printf("  → %08lx rssi=%d sess=%lus%s mat=%.1f%%  SYNC dPh=%+.2f  FUSIONE %d+%d=%d",
         (unsigned long)neighbors[partnerId].idHash,
         neighbors[partnerId].rssiFilt,
+        (unsigned long)(pairSessionMs / 1000), fusing ? ">fonde" : ">rodaggio",
         mat * 100.0f,
-        myPhase, nbPh, dPh,
+        dPh,
         myHue, neighbors[partnerId].hue, dbgShowHue);
+    }
+    if (groupMs > 0) {
+      float gMat = min(1.0f, (float)groupMs / (float)GROUP_FUSION_MS);
+      Serial.printf("  GRUPPO %lus fus=%.0f%%", (unsigned long)(groupMs / 1000), gMat * 100.0f);
     }
     Serial.printf("  met=%u%s", peopleMet, IS_CREATOR ? " [CREATORE]" : "");
     Serial.println();
