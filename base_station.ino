@@ -93,6 +93,15 @@ SemaphoreHandle_t tblMutex = nullptr;
 
 const char* STATS_FILE = "/stats.bin";
 
+// statistiche aggregate (definita in alto: evita errori di auto-prototipo Arduino)
+struct Agg {
+  uint16_t total, present;
+  float    avgMet;
+  uint16_t maxMet; uint32_t maxId;
+  uint16_t cuori, soli, creatori;
+  uint16_t moodCnt[3];
+};
+
 // ── GRAFO: archi (chi ha incontrato chi, con peso = secondi insieme) ─────
 #define MAX_EDGES 2000
 struct __attribute__((packed)) Edge {
@@ -246,6 +255,27 @@ class CollectorCB : public NimBLEScanCallbacks {
 volatile bool loraRxFlag = false;
 void IRAM_ATTR onLoRaIRQ() { loraRxFlag = true; }
 
+// altri Heltec sentiti di recente sulla rete LoRa (per "Heltec attivi")
+#define MAX_STATIONS   16
+#define STATION_TTL_MS 60000UL
+struct Station { uint16_t id; uint32_t lastSeen; };
+Station  stations[MAX_STATIONS];
+uint8_t  stationCount = 0;
+float    lastLoraRssi = 0;     // RSSI dell'ultimo pacchetto LoRa valido ricevuto
+uint32_t lastLoraMs   = 0;
+void noteStation(uint16_t id) {
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < stationCount; i++)
+    if (stations[i].id == id) { stations[i].lastSeen = now; return; }
+  if (stationCount < MAX_STATIONS) { stations[stationCount] = { id, now }; stationCount++; }
+}
+uint8_t activeStations() {     // quanti ALTRI Heltec sentiti negli ultimi 60s
+  uint32_t now = millis(); uint8_t n = 0;
+  for (uint8_t i = 0; i < stationCount; i++)
+    if (now - stations[i].lastSeen < STATION_TTL_MS) n++;
+  return n;
+}
+
 void initLoRa() {
   stationId = (uint16_t)(ESP.getEfuseMac() & 0xFFFF);
   loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -271,11 +301,14 @@ void processLoRaRx() {
   uint8_t buf[256];
   size_t len = radio.getPacketLength();
   int st = radio.readData(buf, len);
+  float rssi = radio.getRSSI();                   // RSSI di questo pacchetto
   radio.startReceive();
   if (st != RADIOLIB_ERR_NONE || len < 5) return;
   if (buf[0] != 'P' || buf[1] != 'A') return;
   uint16_t from = buf[2] | (buf[3] << 8);
   if (from == stationId) return;                  // eco mio, ignora
+  lastLoraRssi = rssi; lastLoraMs = millis();
+  noteStation(from);                              // un altro Heltec è vivo
   uint8_t n = buf[4];
   size_t off = 5;
   uint16_t merged = 0;
@@ -317,14 +350,6 @@ void sendGossip() {
 // ═══════════════════════════════════════════════════════
 //  STATISTICHE AGGREGATE
 // ═══════════════════════════════════════════════════════
-struct Agg {
-  uint16_t total, present;
-  float    avgMet;
-  uint16_t maxMet; uint32_t maxId;
-  uint16_t cuori, soli, creatori;
-  uint16_t moodCnt[3];
-};
-
 Agg computeAgg() {
   Agg a = {};
   if (xSemaphoreTake(tblMutex, pdMS_TO_TICKS(20)) != pdTRUE) return a;
@@ -381,7 +406,7 @@ void drawHistogram() {
 
 void drawDisplay() {
   Agg a = computeAgg();
-  uint8_t page = (millis() / 4000) % 6;   // cambia pagina ogni 4s (6 pagine)
+  uint8_t page = (millis() / 4000) % 7;   // cambia pagina ogni 4s (7 pagine)
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x12_tf);
@@ -428,6 +453,22 @@ void drawDisplay() {
       u8g2.drawStr(0, 28, "Vedi le statistiche:");
       u8g2.drawStr(0, 42, "WiFi: PAMALI-STATS");
       u8g2.drawStr(0, 54, "http://192.168.4.1");
+      break;
+    case 6:
+      u8g2.drawStr(0, 27, "RETE / GRAFO");
+      snprintf(buf, sizeof(buf), "archi: %u", edgeCount);
+      u8g2.drawStr(0, 39, buf);
+      if (loraOK) {
+        snprintf(buf, sizeof(buf), "Heltec in rete: %u", activeStations() + 1);
+        u8g2.drawStr(0, 51, buf);
+        if (lastLoraMs && millis() - lastLoraMs < STATION_TTL_MS)
+          snprintf(buf, sizeof(buf), "LoRa rx: %d dBm", (int)lastLoraRssi);
+        else
+          snprintf(buf, sizeof(buf), "LoRa rx: --");
+        u8g2.drawStr(0, 63, buf);
+      } else {
+        u8g2.drawStr(0, 51, "LoRa: off (solo)");
+      }
       break;
   }
   u8g2.sendBuffer();
