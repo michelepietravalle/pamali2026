@@ -27,7 +27,7 @@
 #define BUTTON_PIN    14
 #define LDR_PIN       34
 #define BADGE_TYPE    0       // 0 = cuore, 1 = sole
-#define IS_CREATOR    1       // 1 SOLO sul TUO badge (il creatore). Gli altri 0.
+#define IS_CREATOR    0      // 1 SOLO sul TUO badge (il creatore). Gli altri 0.
 #define CREATOR_HUE   38      // tonalita' ORO della "firma" del creatore (FastLED hue)
 
 // ═══════════════════════════════════════════════════════
@@ -48,10 +48,15 @@ static const float   EMA_ALPHA  = 0.3f;
 //  KURAMOTO
 // ═══════════════════════════════════════════════════════
 static const float   OMEGA          = 2.0f * PI / 1.2f; // periodo battito 1.2s
-static const float   K_COUPLING     = 4.0f;
+static const float   K_COUPLING     = 6.0f;  // forza aggancio fasi (2K=12 > max Δω≈2.6)
 static const float   MOOD_SPEED[3]  = { 0.8f, 1.0f, 1.3f };
 static const uint8_t MOOD_BRIGHT[3] = {  80,   170,  220 };  // valore FastLED max
 static const float   LED_SPREAD     = 1.0f;  // onda sui LED: 1.0 = un'onda intera sul giro
+// Quando due o piu' badge sono vicini battono ALLO STESSO RITMO COMUNE,
+// indipendente dal mood (Δω=0 → le fasi si agganciano a sfasamento ZERO).
+// Allontanandosi ciascuno torna al ritmo + luminosita' del proprio mood.
+static const float   TOGETHER_SPEED  = 1.0f;  // ritmo comune da vicini (pace "social")
+static const uint8_t TOGETHER_BRIGHT = 200;   // luminosita' comune da vicini
 
 // ═══════════════════════════════════════════════════════
 //  TIMING
@@ -128,6 +133,10 @@ uint16_t peopleMet           = 0;       // persone distinte conosciute (persiste
 
 int      ldrFiltered  = 2048;
 bool     isNight      = false;
+
+// Debug fusione colori + modalita' LED (aggiornati in renderLEDs)
+uint8_t  dbgShowHue   = 0;      // tono effettivamente mostrato (dopo fusione)
+bool     dbgTogether  = false;  // true = LED pulsano ASSIEME, false = onda
 
 NimBLEAdvertising* pAdv = nullptr;
 
@@ -206,7 +215,7 @@ int8_t findOrCreate(uint32_t hash) {
 
   neighbors[slot] = {
     .idHash       = hash,
-    .rssiFilt     = -90,
+    .rssiFilt     = -128,   // sentinella "mai misurato": la 1a lettura aggancia diretta
     .hue          = 0,
     .mood         = 1,
     .phase        = 0.0f,
@@ -244,9 +253,13 @@ class ScanCB : public NimBLEScanCallbacks {              // NimBLE 2.x
     if (xSemaphoreTake(nbMutex, 0) == pdTRUE) {
       int8_t slot = findOrCreate(hash);
       if (slot >= 0) {
-        float raw  = (float)dev->getRSSI();
-        float prev = (float)neighbors[slot].rssiFilt;
-        neighbors[slot].rssiFilt = (int8_t)(EMA_ALPHA * raw + (1.0f - EMA_ALPHA) * prev);
+        float raw = (float)dev->getRSSI();
+        if (neighbors[slot].rssiFilt == -128) {
+          neighbors[slot].rssiFilt = (int8_t)raw;            // 1a misura: aggancio diretto
+        } else {
+          float prev = (float)neighbors[slot].rssiFilt;
+          neighbors[slot].rssiFilt = (int8_t)(EMA_ALPHA * raw + (1.0f - EMA_ALPHA) * prev);
+        }
         neighbors[slot].hue      = p->hue;
         neighbors[slot].mood     = p->mood;
         neighbors[slot].phase    = (float)p->phase / 255.0f * 2.0f * PI;
@@ -292,18 +305,32 @@ void updatePhase(float dt) {
   uint8_t  n    = 0;
   uint32_t now  = millis();
 
+  // Da vicini (PAIRED/TRIBE) si batte a un RITMO COMUNE mood-indipendente, cosi'
+  // le fasi si agganciano a sfasamento zero. Da soli, ritmo del proprio mood.
+  bool  together = (myState == PAIRED || myState == TRIBE);
+  float mySpeed  = together ? TOGETHER_SPEED : MOOD_SPEED[myMood];
+
   if (xSemaphoreTake(nbMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
     for (uint8_t i = 0; i < nbCount; i++) {
-      if (now - neighbors[i].lastSeen > NB_TIMEOUT_MS)  continue;
-      if (neighbors[i].rssiFilt < RSSI_OUT)             continue;
-      pull += sinf(neighbors[i].phase - myPhase);
+      uint32_t age = now - neighbors[i].lastSeen;
+      if (age > NB_TIMEOUT_MS)               continue;
+      if (neighbors[i].rssiFilt < RSSI_OUT)  continue;
+      // La fase ricevuta e' "vecchia" di 'age' ms: nel frattempo il vicino e'
+      // andato avanti. La estrapoliamo in avanti, altrimenti con beacon ogni
+      // ~300-1000ms il dato e' scorrelato e il pull si media a zero. Se siamo
+      // "together" anche lui batte al ritmo comune → uso TOGETHER_SPEED.
+      uint8_t nm    = (neighbors[i].mood < 3) ? neighbors[i].mood : 1;
+      float   nbSpd = together ? TOGETHER_SPEED : MOOD_SPEED[nm];
+      float   est   = neighbors[i].phase
+                    + OMEGA * nbSpd * ((float)age / 1000.0f);
+      pull += sinf(est - myPhase);
       n++;
     }
     xSemaphoreGive(nbMutex);
   }
 
   if (n > 0) pull /= n;
-  myPhase += (OMEGA * MOOD_SPEED[myMood] + K_COUPLING * pull) * dt;
+  myPhase += (OMEGA * mySpeed + K_COUPLING * pull) * dt;
   while (myPhase >= 2.0f * PI) myPhase -= 2.0f * PI;
   while (myPhase <  0.0f)      myPhase += 2.0f * PI;
 }
@@ -416,8 +443,9 @@ void updateLDR() {
 void renderLEDs() {
   uint32_t now = millis();
 
-  // Brightness massima per mood + notte
-  uint8_t maxV = MOOD_BRIGHT[myMood];
+  // Brightness: da vicini = comune (mood-indipendente), da soli = del proprio mood
+  bool    together = (myState == PAIRED || myState == TRIBE);
+  uint8_t maxV     = together ? TOGETHER_BRIGHT : MOOD_BRIGHT[myMood];
   if (isNight) maxV /= 2;
 
   // Hue da mostrare + maturity
@@ -447,7 +475,11 @@ void renderLEDs() {
     xSemaphoreGive(nbMutex);
   }
 
-  // Pulse base: sin(phase) → 0..1
+  // Esponi per il debug seriale: tono fuso + modalita' animazione
+  dbgShowHue  = showHue;
+  dbgTogether = together;
+
+  // Pulse base: sin(phase) → 0..1  (battito ASSIEME: fondo 0%, si spegne del tutto)
   float pulseFrac = sinf(myPhase) * 0.5f + 0.5f;
   uint8_t baseV   = (uint8_t)(pulseFrac * maxV);
 
@@ -484,24 +516,19 @@ void renderLEDs() {
     }
 
     case PAIRED: {
-      // Onda sfasata, piu' luminosa con la maturita' del legame
-      uint8_t pv = (uint8_t)(maxV * (0.7f + 0.3f * maturity));
-      for (int i = 0; i < NUM_LEDS; i++) {
-        float ledPh = myPhase + (float)i * LED_SPREAD * (2.0f * PI / (float)NUM_LEDS);
-        uint8_t v   = (uint8_t)((sinf(ledPh) * 0.5f + 0.5f) * pv);
-        leds[i] = CHSV(showHue, 255, v);
-      }
+      // VICINO A QUALCUNO → tutti i LED pulsano ASSIEME (battito sincronizzato
+      // Kuramoto). L'ampiezza del battito cresce con la maturita' del legame.
+      uint8_t pv = (uint8_t)(baseV * (0.7f + 0.3f * maturity));
+      fill_solid(leds, NUM_LEDS, CHSV(showHue, 255, pv));
       break;
     }
 
-    case TRIBE:
-      // Onda rotante: ogni LED sfasato di 2π/NUM_LEDS
-      for (int i = 0; i < NUM_LEDS; i++) {
-        float ledPh = myPhase + (float)i * (2.0f * PI / (float)NUM_LEDS);
-        uint8_t v   = (uint8_t)((sinf(ledPh) * 0.5f + 0.5f) * maxV);
-        leds[i] = CHSV(showHue, 255, v);
-      }
+    case TRIBE: {
+      // TRIBU' (>=3 vicini) → tutti pulsano ASSIEME a piena luminosita',
+      // colore = media circolare del gruppo (tutti convergono allo stesso tono).
+      fill_solid(leds, NUM_LEDS, CHSV(showHue, 255, baseV));
       break;
+    }
 
     case FAREWELL:
       fill_solid(leds, NUM_LEDS, CHSV(showHue, 200, baseV));
@@ -685,7 +712,13 @@ void setup() {
   // I badge avvertono ogni ~250ms: su piu' cicli i pacchetti vengono comunque
   // raccolti, e l'EMA dell'RSSI integra nel tempo → prossimita' affidabile.
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(new ScanCB(), false);   // NimBLE 2.x (era setAdvertisedDeviceCallbacks)
+  // 2° arg = wantDuplicates. DEVE essere true: vogliamo un report ad OGNI
+  // advertisement cosi' l'RSSI resta fresco. Con 'false' NimBLE attiva il
+  // duplicate-filter (setScanCallbacks chiama setDuplicateFilter(!wantDuplicates))
+  // e ogni badge veniva riportato UNA SOLA volta → i vicini invecchiavano e
+  // non avveniva mai il pairing. ERA QUESTO IL BUG.
+  scan->setScanCallbacks(new ScanCB(), true);    // NimBLE 2.x
+  scan->setMaxResults(0);                          // solo callback, niente accumulo in RAM
   scan->setActiveScan(false);
   scan->setInterval(160);   // ×0.625ms = 100ms (periodo)
   scan->setWindow(48);      // ×0.625ms = 30ms  (finestra accesa) → 30% duty
@@ -750,19 +783,42 @@ void loop() {
     lastDbg = now;
     static const char* stNames[]  = {"IDLE","SENS","PAIR","TRIBE","FARE"};
     static const char* moodNames[]= {"chill","social","party"};
-    Serial.printf("[%lus] %s mood=%s hue=%d phase=%.2f night=%d(ldr=%d) btn=%d nb=%d",
+    Serial.printf("[%lus] %s LED=%-7s mood=%s beat=%-6s hue=%d phase=%.2f night=%d(ldr=%d) btn=%d nb=%d",
       festivalTime() / 1000,
-      stNames[myState], moodNames[myMood],
+      stNames[myState], dbgTogether ? "ASSIEME" : "onda", moodNames[myMood],
+      dbgTogether ? "COMUNE" : moodNames[myMood],
       myHue, myPhase, (int)isNight, ldrFiltered,
       digitalRead(BUTTON_PIN), nbCount);
+    // Diagnostica prossimita': vicino piu' forte e da quanto non lo si sente.
+    // Da vicino deve dare rssi alto (es. -45) e age basso (<500ms).
+    if (nbCount > 0) {
+      int8_t   bRssi = -127;
+      uint32_t bAge  = 0;
+      for (uint8_t i = 0; i < nbCount; i++)
+        if (neighbors[i].rssiFilt > bRssi) {
+          bRssi = neighbors[i].rssiFilt;
+          bAge  = now - neighbors[i].lastSeen;
+        }
+      Serial.printf("  bestRssi=%d age=%lums", bRssi, (unsigned long)bAge);
+    }
     if (partnerId >= 0 && partnerId < nbCount) {
       float mat = min(1.0f,
         (float)neighbors[partnerId].totalContactMs / (float)MATURITY_FULL_MS);
-      Serial.printf("  → %08lx rssi=%d contact=%lus mat=%.0f%%",
+      // fase del partner estrapolata (come nel coupling) + differenza di fase
+      uint8_t pnm  = (neighbors[partnerId].mood < 3) ? neighbors[partnerId].mood : 1;
+      float   pAge = (float)(now - neighbors[partnerId].lastSeen) / 1000.0f;
+      float   pSpd = dbgTogether ? TOGETHER_SPEED : MOOD_SPEED[pnm];
+      float   nbPh = neighbors[partnerId].phase + OMEGA * pSpd * pAge;
+      float   dPh  = nbPh - myPhase;
+      while (dPh >  PI) dPh -= 2.0f * PI;
+      while (dPh < -PI) dPh += 2.0f * PI;
+      nbPh = fmodf(nbPh, 2.0f * PI); if (nbPh < 0) nbPh += 2.0f * PI;
+      Serial.printf("  → %08lx rssi=%d mat=%.0f%%  SYNC myPh=%.2f nbPh=%.2f dPh=%+.2f  FUSIONE %d+%d=%d",
         (unsigned long)neighbors[partnerId].idHash,
         neighbors[partnerId].rssiFilt,
-        neighbors[partnerId].totalContactMs / 1000,
-        mat * 100.0f);
+        mat * 100.0f,
+        myPhase, nbPh, dPh,
+        myHue, neighbors[partnerId].hue, dbgShowHue);
     }
     Serial.printf("  met=%u%s", peopleMet, IS_CREATOR ? " [CREATORE]" : "");
     Serial.println();
