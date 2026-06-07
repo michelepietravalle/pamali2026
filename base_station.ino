@@ -21,6 +21,22 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <RadioLib.h>      // sync grafo via LoRa tra piu' Heltec (installa "RadioLib")
+
+// ── LoRa SX1262 (Heltec WiFi LoRa 32 V3) ────────────────
+#define LORA_NSS   8
+#define LORA_SCK   9
+#define LORA_MOSI  10
+#define LORA_MISO  11
+#define LORA_RST   12
+#define LORA_BUSY  13
+#define LORA_DIO1  14
+#define LORA_FREQ  868.0    // MHz — EU868 (Italia). USA: 915.0
+SPIClass loraSPI(HSPI);
+SX1262   radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
+bool     loraOK = false;
+uint16_t stationId = 0;                 // id univoco di questo Heltec (dal MAC)
+static const uint32_t GOSSIP_MS = 10000; // intervallo broadcast archi (occhio al duty-cycle!)
 
 // ── Access Point WiFi (il telefono si collega qui) ──────
 const char* AP_SSID = "PAMALI-STATS";
@@ -48,6 +64,9 @@ struct __attribute__((packed)) BeaconPayload {
   uint8_t  phase;
   uint32_t tConsensus;
   uint16_t peopleMet;
+  uint8_t  cPage;       // pagina contatti (grafo)
+  uint8_t  cId[2][3];   // ID di 2 contatti
+  uint8_t  cW[2];       // peso in unità da 4s
 };
 
 // ── Tabella statistiche per badge ───────────────────────
@@ -74,6 +93,45 @@ SemaphoreHandle_t tblMutex = nullptr;
 
 const char* STATS_FILE = "/stats.bin";
 
+// ── GRAFO: archi (chi ha incontrato chi, con peso = secondi insieme) ─────
+#define MAX_EDGES 2000
+struct __attribute__((packed)) Edge {
+  uint32_t a;      // id minore (24-bit)
+  uint32_t b;      // id maggiore
+  uint16_t w;      // peso = secondi di contatto (massimo osservato)
+};
+Edge      edges[MAX_EDGES];
+uint16_t  edgeCount = 0;
+uint16_t  gossipCursor = 0;           // round-robin per il broadcast LoRa
+volatile bool edgesDirty = false;
+SemaphoreHandle_t edgeMutex = nullptr;
+const char* EDGES_FILE = "/edges.bin";
+
+int findEdge(uint32_t a, uint32_t b) {
+  for (uint16_t i = 0; i < edgeCount; i++)
+    if (edges[i].a == a && edges[i].b == b) return i;
+  return -1;
+}
+
+// inserisce/aggiorna un arco (non-orientato) tenendo il peso massimo.
+// ritorna true se qualcosa è cambiato (nuovo arco o peso aumentato).
+bool upsertEdge(uint32_t x, uint32_t y, uint16_t w) {
+  if (x == y || x == 0 || y == 0) return false;
+  uint32_t a = x < y ? x : y, b = x < y ? y : x;
+  bool changed = false;
+  if (xSemaphoreTake(edgeMutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+  int idx = findEdge(a, b);
+  if (idx >= 0) {
+    if (w > edges[idx].w) { edges[idx].w = w; changed = true; }
+  } else if (edgeCount < MAX_EDGES) {
+    edges[edgeCount++] = { a, b, w };
+    changed = true;
+  }
+  if (changed) edgesDirty = true;
+  xSemaphoreGive(edgeMutex);
+  return changed;
+}
+
 // ═══════════════════════════════════════════════════════
 //  PERSISTENZA (LittleFS)
 // ═══════════════════════════════════════════════════════
@@ -99,6 +157,30 @@ void loadStats() {
   f.read((uint8_t*)badges, sizeof(BadgeStat) * badgeCount);
   f.close();
   Serial.printf("[FS] caricati %u badge dal riavvio precedente\n", badgeCount);
+}
+
+void saveEdges() {
+  if (xSemaphoreTake(edgeMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+  File f = LittleFS.open(EDGES_FILE, "w");
+  if (f) {
+    f.write((uint8_t*)&edgeCount, sizeof(edgeCount));
+    f.write((uint8_t*)edges, sizeof(Edge) * edgeCount);
+    f.close();
+    Serial.printf("[FS] salvati %u archi\n", edgeCount);
+  }
+  edgesDirty = false;
+  xSemaphoreGive(edgeMutex);
+}
+
+void loadEdges() {
+  if (!LittleFS.exists(EDGES_FILE)) return;
+  File f = LittleFS.open(EDGES_FILE, "r");
+  if (!f) return;
+  f.read((uint8_t*)&edgeCount, sizeof(edgeCount));
+  if (edgeCount > MAX_EDGES) edgeCount = MAX_EDGES;
+  f.read((uint8_t*)edges, sizeof(Edge) * edgeCount);
+  f.close();
+  Serial.printf("[FS] caricati %u archi del grafo\n", edgeCount);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -148,8 +230,89 @@ class CollectorCB : public NimBLEScanCallbacks {
     if (p->companyId != COMPANY_ID || p->proto != PROTO_VER) return;
     uint32_t id = ((uint32_t)p->id[0] << 16) | ((uint32_t)p->id[1] << 8) | p->id[2];
     updateBadge(id, p, (int8_t)dev->getRSSI());
+    // archi del grafo: i 2 contatti trasmessi a rotazione nel beacon
+    for (uint8_t k = 0; k < 2; k++) {
+      uint32_t cid = ((uint32_t)p->cId[k][0] << 16) | ((uint32_t)p->cId[k][1] << 8) | p->cId[k][2];
+      if (cid == 0) continue;
+      upsertEdge(id, cid, (uint16_t)p->cW[k] * 4);   // peso quantizzato → secondi
+    }
   }
 };
+
+// ═══════════════════════════════════════════════════════
+//  LoRa — sync del grafo tra piu' Heltec (gossip + merge)
+// ═══════════════════════════════════════════════════════
+#define EDGES_PER_PACKET 24
+volatile bool loraRxFlag = false;
+void IRAM_ATTR onLoRaIRQ() { loraRxFlag = true; }
+
+void initLoRa() {
+  stationId = (uint16_t)(ESP.getEfuseMac() & 0xFFFF);
+  loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
+  int st = radio.begin(LORA_FREQ);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("[LoRa] init err %d → sync grafo DISATTIVO (singolo Heltec ok)\n", st);
+    loraOK = false;
+    return;
+  }
+  radio.setOutputPower(14);     // dBm
+  radio.setBandwidth(125.0);
+  radio.setSpreadingFactor(7);  // SF7: airtime basso (~duty 1% a 10s). Alza per piu' portata
+  radio.setCodingRate(7);
+  radio.setSyncWord(0x34);
+  radio.setDio1Action(onLoRaIRQ);
+  radio.startReceive();
+  loraOK = true;
+  Serial.printf("[LoRa] pronto a %.1fMHz, stazione #%u\n", LORA_FREQ, stationId);
+}
+
+// pacchetto ricevuto → merge archi nella tabella locale
+void processLoRaRx() {
+  uint8_t buf[256];
+  size_t len = radio.getPacketLength();
+  int st = radio.readData(buf, len);
+  radio.startReceive();
+  if (st != RADIOLIB_ERR_NONE || len < 5) return;
+  if (buf[0] != 'P' || buf[1] != 'A') return;
+  uint16_t from = buf[2] | (buf[3] << 8);
+  if (from == stationId) return;                  // eco mio, ignora
+  uint8_t n = buf[4];
+  size_t off = 5;
+  uint16_t merged = 0;
+  for (uint8_t k = 0; k < n && off + 8 <= len; k++) {
+    uint32_t a = ((uint32_t)buf[off] << 16) | ((uint32_t)buf[off+1] << 8) | buf[off+2]; off += 3;
+    uint32_t b = ((uint32_t)buf[off] << 16) | ((uint32_t)buf[off+1] << 8) | buf[off+2]; off += 3;
+    uint16_t w = buf[off] | (buf[off+1] << 8); off += 2;
+    if (upsertEdge(a, b, w)) merged++;
+  }
+  if (merged) Serial.printf("[LoRa] da #%u: %u archi nuovi/aggiornati\n", from, merged);
+}
+
+// broadcast di un lotto di archi (round-robin sulla lista)
+void sendGossip() {
+  if (!loraOK || edgeCount == 0) return;
+  uint8_t buf[256];
+  buf[0] = 'P'; buf[1] = 'A';
+  buf[2] = stationId & 0xFF; buf[3] = stationId >> 8;
+  uint8_t  n = 0;
+  size_t   off = 5;
+  if (xSemaphoreTake(edgeMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    for (uint8_t k = 0; k < EDGES_PER_PACKET && k < edgeCount; k++) {
+      uint16_t i = (gossipCursor + k) % edgeCount;
+      buf[off++] = edges[i].a >> 16; buf[off++] = edges[i].a >> 8; buf[off++] = edges[i].a;
+      buf[off++] = edges[i].b >> 16; buf[off++] = edges[i].b >> 8; buf[off++] = edges[i].b;
+      buf[off++] = edges[i].w & 0xFF; buf[off++] = edges[i].w >> 8;
+      n++;
+    }
+    gossipCursor = (gossipCursor + n) % edgeCount;
+    xSemaphoreGive(edgeMutex);
+  }
+  buf[4] = n;
+  int st = radio.transmit(buf, off);
+  loraRxFlag = false;            // scarta eventuale flag spurio del TxDone
+  radio.startReceive();
+  if (st != RADIOLIB_ERR_NONE) Serial.printf("[LoRa] TX err %d\n", st);
+}
 
 // ═══════════════════════════════════════════════════════
 //  STATISTICHE AGGREGATE
@@ -295,7 +458,12 @@ void handleSerial() {
   else if (c == 's') saveStats();
   else if (c == 'r') {
     badgeCount = 0; LittleFS.remove(STATS_FILE);
-    Serial.println("[RESET] statistiche azzerate");
+    edgeCount = 0;  gossipCursor = 0; LittleFS.remove(EDGES_FILE);
+    Serial.println("[RESET] statistiche e grafo azzerati");
+  }
+  else if (c == 'g') {
+    if (loraOK) { sendGossip(); Serial.println("[LoRa] gossip forzato"); }
+    else Serial.println("[LoRa] non disponibile");
   }
 }
 
@@ -361,6 +529,107 @@ void handleCSVweb() {
   server.send(200, "text/csv", s);
 }
 
+// ── GRAFO: nodi (badge) + archi (incontri pesati), in streaming chunked ──
+void handleGraphData() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  uint32_t now = millis();
+  String j; j.reserve(2048);
+  j = "{\"nodes\":[";
+  if (xSemaphoreTake(tblMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (uint16_t i = 0; i < badgeCount; i++) {
+      BadgeStat& b = badges[i];
+      char id[8]; snprintf(id, sizeof(id), "%06X", b.id);
+      if (i) j += ",";
+      uint8_t t = (b.type & 0x80) ? 2 : (b.type & 1);   // 2=creatore 1=sole 0=cuore
+      j += "{\"id\":\""; j += id; j += "\",\"h\":"; j += b.lastHue;
+      j += ",\"t\":"; j += t; j += ",\"m\":"; j += b.peopleMet;
+      j += ",\"p\":"; j += (now - b.lastSeenMs < PRESENT_MS) ? 1 : 0; j += "}";
+      if (j.length() > 1500) { server.sendContent(j); j = ""; }
+    }
+    xSemaphoreGive(tblMutex);
+  }
+  j += "],\"edges\":[";
+  if (xSemaphoreTake(edgeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    for (uint16_t i = 0; i < edgeCount; i++) {
+      char a[8], b2[8];
+      snprintf(a, sizeof(a), "%06X", edges[i].a);
+      snprintf(b2, sizeof(b2), "%06X", edges[i].b);
+      if (i) j += ",";
+      j += "[\""; j += a; j += "\",\""; j += b2; j += "\","; j += edges[i].w; j += "]";
+      if (j.length() > 1500) { server.sendContent(j); j = ""; }
+    }
+    xSemaphoreGive(edgeMutex);
+  }
+  j += "]}";
+  server.sendContent(j);
+  server.sendContent("");
+}
+
+void handleEdgesCSV() {
+  server.sendHeader("Content-Disposition", "attachment; filename=pamali_grafo.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("a,b,secondi_insieme\n");
+  if (xSemaphoreTake(edgeMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    String s; s.reserve(1700);
+    for (uint16_t i = 0; i < edgeCount; i++) {
+      char line[40];
+      snprintf(line, sizeof(line), "%06X,%06X,%u\n", edges[i].a, edges[i].b, edges[i].w);
+      s += line;
+      if (s.length() > 1500) { server.sendContent(s); s = ""; }
+    }
+    server.sendContent(s);
+    xSemaphoreGive(edgeMutex);
+  }
+  server.sendContent("");
+}
+
+const char GRAPH_HTML[] PROGMEM = R"GRF(<!DOCTYPE html><html lang="it"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pamali — rete</title><style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:#0d1530;overflow:hidden;font-family:system-ui,sans-serif}
+#c{display:block;width:100vw;height:100vh;touch-action:none}
+#h{position:fixed;top:8px;left:0;right:0;text-align:center;color:#ffd24d;font-size:15px;pointer-events:none}
+#i{position:fixed;bottom:8px;left:0;right:0;text-align:center;color:#7890b8;font-size:11px;pointer-events:none}
+a{position:fixed;top:7px;right:10px;color:#8af;font-size:12px;text-decoration:none}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="h">PAMALI — rete degli incontri</div>
+<a href="/">‹ stats</a>
+<div id="i">nodi = persone · linee = tempo passato insieme · oro = creatore · trascina/zoom</div>
+<script>
+const cv=document.getElementById('c'),cx=cv.getContext('2d');
+let W,H,DPR;function rs(){DPR=devicePixelRatio||1;W=cv.clientWidth;H=cv.clientHeight;cv.width=W*DPR;cv.height=H*DPR;cx.setTransform(DPR,0,0,DPR,0,0)}
+addEventListener('resize',rs);rs();
+let N=new Map(),E=[];let view={x:W/2,y:H/2,s:1};let auto=true;
+function col(h){return 'hsl('+(h/255*360)+',75%,55%)'}
+function fit(){let ns=[...N.values()];if(!ns.length)return;let xn=1e9,xx=-1e9,yn=1e9,yx=-1e9;ns.forEach(n=>{xn=Math.min(xn,n.x);xx=Math.max(xx,n.x);yn=Math.min(yn,n.y);yx=Math.max(yx,n.y)});let w=(xx-xn)||1,h=(yx-yn)||1,s=Math.min(W/(w+90),H/(h+90),2.2);view.s=view.s*.9+s*.1;view.x=view.x*.9+(W/2-(xn+xx)/2*view.s)*.1;view.y=view.y*.9+(H/2-(yn+yx)/2*view.s)*.1}
+function load(){fetch('/graphdata').then(r=>r.json()).then(d=>{
+ d.nodes.forEach(n=>{let o=N.get(n.id);if(!o){o={id:n.id,x:(Math.random()-.5)*240,y:(Math.random()-.5)*240,vx:0,vy:0};N.set(n.id,o)}o.h=n.h;o.t=n.t;o.m=n.m;o.p=n.p;o.gray=0});
+ d.edges.forEach(e=>{[e[0],e[1]].forEach(id=>{if(!N.has(id))N.set(id,{id,x:(Math.random()-.5)*240,y:(Math.random()-.5)*240,vx:0,vy:0,h:150,t:0,m:0,p:0,gray:1})})});
+ E=d.edges.map(e=>({a:N.get(e[0]),b:N.get(e[1]),w:e[2]})).filter(e=>e.a&&e.b);
+}).catch(()=>{})}
+load();setInterval(load,10000);
+function step(){let ns=[...N.values()];
+ for(let i=0;i<ns.length;i++){let a=ns[i];for(let j=i+1;j<ns.length;j++){let b=ns[j];let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy+.01,d=Math.sqrt(d2),f=700/d2,fx=f*dx/d,fy=f*dy/d;a.vx+=fx;a.vy+=fy;b.vx-=fx;b.vy-=fy}}
+ E.forEach(e=>{let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)+.01,L=45+130/(1+e.w/40),f=(d-L)*.01,fx=f*dx/d,fy=f*dy/d;e.a.vx+=fx;e.a.vy+=fy;e.b.vx-=fx;e.b.vy-=fy});
+ ns.forEach(n=>{n.vx-=n.x*.002;n.vy-=n.y*.002;n.vx*=.85;n.vy*=.85;n.x+=n.vx;n.y+=n.vy})}
+function draw(){cx.clearRect(0,0,W,H);cx.save();cx.translate(view.x,view.y);cx.scale(view.s,view.s);
+ E.forEach(e=>{cx.strokeStyle='rgba(130,160,220,'+Math.min(.75,.1+e.w/500)+')';cx.lineWidth=Math.min(5,.5+e.w/100);cx.beginPath();cx.moveTo(e.a.x,e.a.y);cx.lineTo(e.b.x,e.b.y);cx.stroke()});
+ N.forEach(n=>{let r=4+Math.sqrt(n.m||0)*2.2;cx.globalAlpha=n.p?1:.55;cx.beginPath();cx.arc(n.x,n.y,r,0,7);cx.fillStyle=n.gray?'#3a4a6a':col(n.h);cx.fill();cx.globalAlpha=1;if(n.t==2){cx.strokeStyle='#ffd24d';cx.lineWidth=2.5;cx.stroke()}});
+ cx.restore()}
+function loop(){step();step();if(auto)fit();draw();requestAnimationFrame(loop)}loop();
+let drag=null;
+cv.addEventListener('pointerdown',e=>{auto=false;drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y}});
+addEventListener('pointermove',e=>{if(drag){view.x=drag.vx+(e.clientX-drag.x);view.y=drag.vy+(e.clientY-drag.y)}});
+addEventListener('pointerup',()=>drag=null);
+cv.addEventListener('wheel',e=>{e.preventDefault();auto=false;view.s*=e.deltaY<0?1.1:.9},{passive:false});
+</script></body></html>)GRF";
+
+void handleGraph()    { server.send_P(200, "text/html", GRAPH_HTML); }
+
 const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="it"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pamali Stats</title><style>
@@ -400,6 +669,7 @@ small{color:#567;display:block;text-align:center;margin-top:6px}
  <th data-k="id">ID</th><th data-k="type">tipo</th><th data-k="mood">mood</th>
  <th data-k="met">incontri</th><th data-k="vis">visite</th><th data-k="pre">qui</th>
 </tr></thead><tbody id="rows"></tbody></table>
+<a class="dl" href="/graph">&#128376;&#65039; rete degli incontri (grafo)</a>
 <a class="dl" href="/data.csv">scarica CSV</a>
 <small id="ts"></small>
 <script>
@@ -448,9 +718,10 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== PAMALI base station ===");
-  Serial.println("comandi: d=dump  s=salva  r=reset");
+  Serial.println("comandi: d=dump  s=salva  r=reset  g=gossip LoRa");
 
-  tblMutex = xSemaphoreCreateMutex();
+  tblMutex  = xSemaphoreCreateMutex();
+  edgeMutex = xSemaphoreCreateMutex();
 
   // accendi periferiche (Vext) + OLED
   pinMode(VEXT_PIN, OUTPUT); digitalWrite(VEXT_PIN, LOW); delay(50);
@@ -465,7 +736,10 @@ void setup() {
 
   // filesystem persistente
   if (!LittleFS.begin(true)) Serial.println("[FS] errore LittleFS");
-  else loadStats();
+  else { loadStats(); loadEdges(); }
+
+  // LoRa per il sync del grafo tra piu' Heltec (opzionale: se assente, prosegue)
+  initLoRa();
 
   // BLE scan continuo (alimentato, niente risparmio)
   NimBLEDevice::init("PAMALI-BASE");
@@ -483,29 +757,37 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/data.csv", handleCSVweb);
+  server.on("/graph", handleGraph);
+  server.on("/graphdata", handleGraphData);
+  server.on("/edges.csv", handleEdgesCSV);
   server.begin();
   Serial.printf("WiFi AP '%s' (pw '%s')  →  http://%s\n", AP_SSID, AP_PASS, ip.toString().c_str());
 
   Serial.println("scan avviato.\n");
 }
 
-uint32_t lastSave = 0, lastSummary = 0, lastDraw = 0;
+uint32_t lastSave = 0, lastSummary = 0, lastDraw = 0, lastGossip = 0, lastEdgeSave = 0;
 
 void loop() {
   handleSerial();
   server.handleClient();          // serve le richieste del telefono
   uint32_t now = millis();
 
+  // LoRa: ricevi archi da altri Heltec e fai broadcast dei tuoi (gossip)
+  if (loraRxFlag) { loraRxFlag = false; processLoRaRx(); }
+  if (loraOK && now - lastGossip >= GOSSIP_MS) { sendGossip(); lastGossip = now; }
+
   if (now - lastDraw >= 500) { drawDisplay(); lastDraw = now; }
 
   // salva su flash ogni 30s se ci sono novita'
-  if (dirty && now - lastSave >= 30000) { saveStats(); lastSave = now; }
+  if (dirty      && now - lastSave     >= 30000) { saveStats(); lastSave     = now; }
+  if (edgesDirty && now - lastEdgeSave >= 30000) { saveEdges(); lastEdgeSave = now; }
 
   // riepilogo seriale ogni 15s
   if (now - lastSummary >= 15000) {
     Agg a = computeAgg();
-    Serial.printf("[%lus] badge=%u presenti=%u mediaIncontri=%.2f record=%u (cuori=%u soli=%u creatori=%u)\n",
-      now / 1000, a.total, a.present, a.avgMet, a.maxMet, a.cuori, a.soli, a.creatori);
+    Serial.printf("[%lus] badge=%u presenti=%u mediaIncontri=%.2f record=%u (cuori=%u soli=%u creatori=%u) archi=%u\n",
+      now / 1000, a.total, a.present, a.avgMet, a.maxMet, a.cuori, a.soli, a.creatori, edgeCount);
     lastSummary = now;
   }
   delay(20);
