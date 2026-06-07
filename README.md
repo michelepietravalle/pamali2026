@@ -1,12 +1,20 @@
-Due badge luminosi da portare al collo, che ti aiutano a conoscere le persone.
+Il tuo badge Pamali ✨
+Questo non è una semplice spilla luminosa: è un piccolo essere vivente che reagisce alle persone intorno a te. Più ti avvicini agli altri, più cose succedono. È fatto per farti incontrare gente nuova. Hai un solo pulsante. Tutto qui.
 
-Al festival girano due tipi di badge: il Cuore fiammeggiante e il Sole con il suo volto. Ognuno ha dentro delle luci e un piccolo cervello elettronico, e parla con gli altri badge via radio, senza app e senza telefono.
-
-Come funziona, in pratica:
-
-Scegli il tuo colore. Con un pulsante scegli la luce che ti rappresenta in quel momento. È il tuo "colore dell'anima" della serata.
-Quando incontri qualcuno, i vostri badge se ne accorgono: più vi avvicinate, più le luci pulsano forte. A meno di un metro i due badge entrano "in risonanza": le luci iniziano a battere allo stesso ritmo e i vostri colori si fondono in uno nuovo. È il segno, visibile anche a chi vi guarda, che due persone si stanno conoscendo.
-Più restate vicini, più il legame "matura": il battito cambia, diventa più profondo. E il badge ricorda chi hai incontrato: se vi rivedete più tardi (anche un altro giorno), vi riconoscete con un saluto diverso.
-In gruppo nasce la "tribù": se tre o più persone restano insieme, tutti i badge si sincronizzano sullo stesso colore e pulsano all'unisono — un gruppo di amici diventa una piccola costellazione luminosa.
-Il battito del festival: ogni tanto, tutti i badge del festival pulsano insieme per qualche secondo. Un momento collettivo, visibile in mezzo alla folla.
-Di notte le luci si addolciscono da sole: il badge "vede" il buio attraverso l'occhio (che è un piccolo sensore di luce) e abbassa la luminosità.
+🎨 Il pulsante: il tuo colore e il tuo umore
+Un tocco veloce → cambi COLORE. Il colore sei tu: tocca ancora per scorrere la tavolozza finché trovi il tuo.
+Tieni premuto (1 sec) → cambi UMORE: chill → social → party → chill…
+(Premuto a lungo 5 sec → reset. Difficilmente ti servirà.)
+🌈 Le tre modalità (quando sei per conto tuo)
+🌙 chill — un respiro lento e profondo, tutto il badge che si illumina e si spegne con calma.
+👥 social — le luci si accendono una dopo l'altra riempiendo il badge, poi si svuotano a ritroso.
+🎉 party — tutte le luci lampeggiano veloci, mille colori diversi che si rincorrono (prendono il posto del tuo colore: è il momento di scatenarsi).
+💞 La magia: quando incontri qualcuno
+Vi avvicinate → il badge "sente" qualcuno e fa girare una lucina: "ehi, c'è qualcuno…"
+Vicini (meno di un metro) → i badge battono all'unisono, allo stesso ritmo qualunque sia il vostro umore, e i colori si fondono: più restate vicini, più si mescolano.
+In tre o più → nasce una tribù: tutti battono insieme, un colore solo fatto di tutti voi.
+Vi allontanate → dissolvenza, e il badge torna al tuo colore e umore.
+🌟 Dettagli che lo rendono vivo
+Di sera abbassa la luce da solo.
+Ogni tanto tutti i badge battono un colpo insieme.
+Ricorda quante persone hai incontrato.
