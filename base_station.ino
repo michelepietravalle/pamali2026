@@ -782,19 +782,13 @@ void setup() {
   // LoRa per il sync del grafo tra piu' Heltec (opzionale: se assente, prosegue)
   initLoRa();
 
-  // BLE scan continuo (alimentato, niente risparmio)
-  NimBLEDevice::init("PAMALI-BASE");
-  NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(new CollectorCB(), true);  // wantDuplicates=true
-  scan->setActiveScan(false);
-  scan->setInterval(100);
-  scan->setWindow(100);
-  scan->start(0, false);
-
-  // WiFi Access Point + web server (il telefono si collega a PAMALI-STATS)
+  // ── WiFi Access Point PRIMA dello scan BLE, cosi' l'AP si stabilizza ──
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.setSleep(false);                                  // AP sempre sveglio
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);    // canale 1, max 4 client
   IPAddress ip = WiFi.softAPIP();
+  Serial.printf("WiFi AP '%s' (pw '%s') %s  →  http://%s\n",
+    AP_SSID, AP_PASS, apOk ? "OK" : "FALLITO", ip.toString().c_str());
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/data.csv", handleCSVweb);
@@ -802,7 +796,16 @@ void setup() {
   server.on("/graphdata", handleGraphData);
   server.on("/edges.csv", handleEdgesCSV);
   server.begin();
-  Serial.printf("WiFi AP '%s' (pw '%s')  →  http://%s\n", AP_SSID, AP_PASS, ip.toString().c_str());
+
+  // ── BLE scan in DUTY-CYCLE (NON 100%! la finestra continua soffoca il WiFi
+  //    e l'access point non riesce ad autenticare il telefono) ──
+  NimBLEDevice::init("PAMALI-BASE");
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(new CollectorCB(), true);      // wantDuplicates=true
+  scan->setActiveScan(false);
+  scan->setInterval(160);   // periodo 100ms
+  scan->setWindow(64);      // acceso 40ms → 40% duty: lascia tempo radio al WiFi
+  scan->start(0, false);
 
   Serial.println("scan avviato.\n");
 }
