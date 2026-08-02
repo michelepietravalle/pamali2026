@@ -27,10 +27,13 @@
 #define LDR_PIN       34
 
 // ── TIPO DI BADGE: imposta QUI quale stai programmando ──
+// (build_all.sh li sovrascrive da riga di comando con -DBADGE_TYPE=... )
 #define BADGE_CUORE   0
 #define BADGE_SOLE    1
 #define BADGE_FUNGO   2       // badge di test/debug (7 LED)
-#define BADGE_TYPE    BADGE_CUORE
+#ifndef BADGE_TYPE
+  #define BADGE_TYPE  BADGE_CUORE
+#endif
 
 #if   BADGE_TYPE == BADGE_CUORE
   #define NUM_LEDS    22
@@ -40,7 +43,9 @@
   #define NUM_LEDS    7        // FUNGO (test)
 #endif
 
-#define IS_CREATOR    0      // 1 SOLO sul TUO badge (il creatore). Gli altri 0.
+#ifndef IS_CREATOR
+  #define IS_CREATOR  0      // 1 SOLO sul TUO badge (il creatore). Gli altri 0.
+#endif
 #define CREATOR_HUE   38      // tonalita' ORO della "firma" del creatore (FastLED hue)
 
 // ═══════════════════════════════════════════════════════
@@ -56,7 +61,7 @@ static const uint8_t  PROTO_VER   = 1;
 //   20cm→-67   70cm→-79   1.5m→-84   3m→-92   (modello ≈ -82 - 21·log10 d)
 static const int8_t  RSSI_IN    = -82;  // entra PAIRED / fusione piena  (~1m)
 static const int8_t  RSSI_OUT   = -88;  // coupling fasi + tribù; USCITA (~2m)
-static const int8_t  RSSI_SENSE = -92;  // entra SENSING / rilevamento   (~3m)
+static const int8_t  RSSI_SENSE = -90;  // entra SENSING / rilevamento (~7m sul campo)
 static const float   EMA_ALPHA  = 0.2f;  // piu' filtrato: RSSI debole/rumoroso (antenna reale)
 
 // ═══════════════════════════════════════════════════════
@@ -69,7 +74,7 @@ static const uint8_t MOOD_BRIGHT[4] = {  80,   170,  220,  180 }; // valore Fast
 // Mood 3 "RASTA": gruppo di LED sempre accesi che cicla rosso/oro/verde + resto che batte
 static const uint8_t  RASTA_STEADY[]   = { 4,5,6,7,8,9,10,18,19,20 }; // LED fissi (numeraz. 1-based)
 static const uint32_t RASTA_CYCLE_MS   = 4000;  // cambio colore del gruppo fisso
-static const uint32_t RASTA_BEAT_MS    = 3000;  // periodo battito degli altri LED
+static const uint32_t RASTA_BEAT_MS    = 6000;  // periodo battito degli altri LED (lento)
 static const uint8_t  RASTA_HUES[3]    = { 0, 38, 96 };  // rosso, oro, verde
 // Quando due o piu' badge sono vicini battono ALLO STESSO RITMO COMUNE,
 // indipendente dal mood (Δω=0 → le fasi si agganciano a sfasamento ZERO).
@@ -81,8 +86,9 @@ static const uint32_t CHILL_BREATH_MS = 10000;// durata di un respiro completo i
 // ── MAPPA "SOCIAL": livello a cui si accende ogni LED (indice 0-based) ──
 // Riempimento secondo il cablaggio FISICO del badge; svuotamento al contrario.
 #if   BADGE_TYPE == BADGE_CUORE
+// Sequenza: 15 → 16,14 → 1,22,13 → 2,17,12 → 3,21,11 → 20 → 4,18,19,10 → 5,9 → 6,8 → 7
 static const uint8_t  SOCIAL_LEVEL[NUM_LEDS] =
-  { 2,3,4,5,6,7,8,7,6,5,4,3,2,1,0,1,3,9,9,9,4,2 };
+  { 2,3,4,6,7,8,9,8,7,6,4,3,2,1,0,1,3,6,6,5,4,2 };
 static const uint8_t  SOCIAL_MAXLEVEL = 9;
 #elif BADGE_TYPE == BADGE_SOLE
 static const uint8_t  SOCIAL_LEVEL[NUM_LEDS] =
@@ -99,7 +105,8 @@ static const uint32_t SOCIAL_FILL_MS = 6000;  // riempimento+svuotamento complet
 // ═══════════════════════════════════════════════════════
 static const uint32_t NB_TIMEOUT_MS     =   4000;
 static const uint32_t TRIBE_TIME_MS     =   3000; // >2 badge per 3s → entra in TRIBE
-static const uint32_t GROUP_FUSION_MS   =  40000; // gruppo: fusione piena in ~40s
+static const uint32_t GROUP_FUSION_MS   = 240000; // gruppo: fusione piena. 2400000ms = 4 MINUTI
+                                                   // (40s = 40000, 4min = 240000, 10min = 600000)
 static const uint32_t HB_INTERVAL_MS   = 600000; // heartbeat ogni 10 min
 static const uint32_t HB_DUR_MS        =   5000;
 static const uint32_t ADV_INTERVAL_MS  =    160;  // ripubblica payload piu' spesso (fase fresca)
@@ -148,6 +155,7 @@ struct Neighbor {
   float    phase;
   uint32_t lastSeen;
   uint32_t firstPaired;
+  uint32_t sessionMs;        // durata dell'incontro IN CORSO con questo vicino (rodaggio 5s)
   uint32_t totalContactMs;
   bool     knownBefore;
   bool     isCreator;        // il vicino e' il badge del CREATORE
@@ -179,8 +187,7 @@ int8_t   partnerId    = -1;
 uint32_t groupMs      = 0;   // da quanto il gruppo (>2 badge) è insieme → fusione gruppo
 uint32_t farewellStart= 0;
 
-uint32_t pairSessionMs   = 0;   // durata dell'avvicinamento in corso (per i 5s di rodaggio)
-uint32_t pairSessionHash = 0;   // con CHI e' la sessione (idHash); 0 = nessuna
+// (la sessione d'incontro e' ora per-vicino: Neighbor.sessionMs)
 
 bool     recognitionPending = false;
 uint32_t recognitionStart   = 0;
@@ -212,6 +219,14 @@ SemaphoreHandle_t nbMutex = nullptr;
 
 uint32_t festivalTime() {
   return millis() - bootMs + t0Offset;
+}
+
+// Eta' di un timestamp, SENZA underflow. Il callback BLE gira su un altro task e
+// puo' aggiornare lastSeen DOPO che il loop ha letto 'now': in quel caso
+// (now - lastSeen) va in underflow a ~4.29e9 e il vicino risulta "scaduto"
+// → sessioni azzerate, vicini esclusi dal coupling, sync che salta.
+static inline uint32_t ageMs(uint32_t now, uint32_t stamp) {
+  return (now >= stamp) ? (now - stamp) : 0;
 }
 
 // Blend circolare hue FastLED (0-255). w=0→a, w=1→b
@@ -309,6 +324,7 @@ int8_t findOrCreate(uint32_t hash) {
     .phase        = 0.0f,
     .lastSeen     = millis(),
     .firstPaired  = 0,
+    .sessionMs    = 0,
     .totalContactMs = saved,
     .knownBefore  = (saved > 0)
   };
@@ -420,7 +436,7 @@ void updatePhase(float dt) {
 
   if (xSemaphoreTake(nbMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
     for (uint8_t i = 0; i < nbCount; i++) {
-      uint32_t age = now - neighbors[i].lastSeen;
+      uint32_t age = ageMs(now, neighbors[i].lastSeen);
       if (age > NB_TIMEOUT_MS)               continue;
       if (neighbors[i].rssiFilt < RSSI_OUT)  continue;
       // La fase ricevuta e' "vecchia" di 'age' ms: nel frattempo il vicino e'
@@ -466,7 +482,7 @@ void updateState(float dt) {
   uint8_t pairedGrade = 0;
 
   for (uint8_t i = 0; i < nbCount; i++) {
-    if (now - neighbors[i].lastSeen > NB_TIMEOUT_MS) continue;
+    if (ageMs(now, neighbors[i].lastSeen) > NB_TIMEOUT_MS) continue;
     if (neighbors[i].rssiFilt > bestRssi) {
       bestRssi = neighbors[i].rssiFilt;
       bestSlot = i;
@@ -532,23 +548,25 @@ void updateState(float dt) {
     groupMs = 0;
   }
 
-  // ── Sessione d'incontro: ad OGNI avvicinamento la fusione riprende solo dopo
-  //    FUSION_GRACE_MS (5s); il livello riparte dalla soglia gia' raggiunta con
-  //    questa persona (totalContactMs e' persistente). Fusione piena a 30 min.
-  if ((myState == PAIRED || myState == TRIBE) && partnerId >= 0) {
-    uint32_t h = neighbors[partnerId].idHash;
-    if (pairSessionHash != h) {        // nuovo avvicinamento con questa persona
-      pairSessionHash = h;
-      pairSessionMs   = 0;             // riparte il "rodaggio" di 5s
+  // ── Sessione d'incontro, PER OGNI VICINO (non solo il "migliore"): ad ogni
+  //    avvicinamento la fusione riprende dopo FUSION_GRACE_MS (5s) e il livello
+  //    riparte dalla soglia gia' raggiunta (totalContactMs persistente).
+  //    NB: era una sola sessione legata al partner; in un gruppo il partner
+  //    rimbalza tra i badge e il rodaggio ripartiva in continuazione, perdendo
+  //    meta' del tempo di contatto. Ora ognuno ha la sua sessione e in una
+  //    tribu' si accumula contatto con TUTTI quelli vicini, non solo con uno.
+  uint32_t dtMs = (uint32_t)(dt * 1000.0f);
+  for (uint8_t i = 0; i < nbCount; i++) {
+    bool together = (ageMs(now, neighbors[i].lastSeen) <= NB_TIMEOUT_MS) &&
+                    (neighbors[i].rssiFilt > RSSI_OUT);   // stessa isteresi del pairing
+    if (together) {
+      neighbors[i].sessionMs += dtMs;
+      if (neighbors[i].sessionMs >= FUSION_GRACE_MS)
+        neighbors[i].totalContactMs += dtMs;
     } else {
-      pairSessionMs += (uint32_t)(dt * 1000.0f);
+      neighbors[i].sessionMs = 0;      // separati → al prossimo incontro rodaggio da capo
     }
-    if (pairSessionMs >= FUSION_GRACE_MS)   // dopo i 5s: accumula verso i 30 min
-      neighbors[partnerId].totalContactMs += (uint32_t)(dt * 1000.0f);
-  } else if (myState == IDLE || myState == SENSING) {
-    pairSessionHash = 0;               // separati → il prossimo incontro riparte dai 5s
-    pairSessionMs   = 0;
-  } // durante FAREWELL: si tiene la sessione (se si torna vicini non riparte il rodaggio)
+  }
 
   xSemaphoreGive(nbMutex);
 }
@@ -586,7 +604,7 @@ void renderLEDs() {
       if (myState == PAIRED) {
         // gate dei 5s: la fusione (ri)compare solo dopo il rodaggio, con una
         // breve dissolvenza che riprende dalla soglia gia' raggiunta.
-        float act = constrain(((float)pairSessionMs - (float)FUSION_GRACE_MS)
+        float act = constrain(((float)neighbors[partnerId].sessionMs - (float)FUSION_GRACE_MS)
                               / (float)FUSION_RESUME_MS, 0.0f, 1.0f);
         showHue = blendHue(myHue, neighbors[partnerId].hue, 0.5f * maturity * act);
       }
@@ -595,7 +613,7 @@ void renderLEDs() {
         uint8_t tn = 0;
         tribeHues[tn++] = myHue;
         for (uint8_t i = 0; i < nbCount; i++) {
-          if (now - neighbors[i].lastSeen > NB_TIMEOUT_MS) continue;
+          if (ageMs(now, neighbors[i].lastSeen) > NB_TIMEOUT_MS) continue;
           if (neighbors[i].rssiFilt > RSSI_OUT)
             tribeHues[tn++] = neighbors[i].hue;
         }
@@ -629,15 +647,16 @@ void renderLEDs() {
       // Da SOLO: ogni mood ha la sua animazione "personale".
       switch (myMood) {
 
-        case 0: {  // CHILL — respiro lento 10s. Colore pieno + luminosita' via
-                   // brightness GLOBALE: FastLED applica il dithering temporale
-                   // → niente scatti anche a luce bassa. Curva sin(ph/2): tocca
-                   // lo 0 e RISALE SUBITO (fondo a punta), cima morbida.
-          fill_solid(leds, NUM_LEDS, CHSV(myHue, 255, 255));
+        case 0: {  // CHILL — respiro lento 10s a PIENA risoluzione (0-255), con
+                   // brightness globale FISSA a maxV → dithering sempre attivo
+                   // (niente scatti) e gli overlay (aura creatore) non vengono
+                   // trascinati giu' dal respiro. Curva sin(ph/2): tocca lo 0
+                   // e risale subito, cima morbida.
           float   ph     = (float)(now % CHILL_BREATH_MS) / (float)CHILL_BREATH_MS * 2.0f * PI;
-          float   breath = sinf(ph * 0.5f);                 // 0 → 1 → 0, rimbalzo netto in basso
+          float   breath = sinf(ph * 0.5f);                 // 0 → 1 → 0
           uint8_t lin    = (uint8_t)(breath * 255.0f);
-          showBright     = scale8(lin, maxV);  // LINEARE (niente gamma quadratica): tempo spento quasi nullo
+          fill_solid(leds, NUM_LEDS, CHSV(myHue, 255, lin));
+          showBright     = maxV;
           break;
         }
 
@@ -665,17 +684,20 @@ void renderLEDs() {
         }
 
         default: {  // RASTA — i LED in RASTA_STEADY sempre accesi, colore che
-                    // cicla rosso→oro→verde ogni 4s; gli ALTRI battono tutti
-                    // assieme ogni 3s col colore scelto col pulsante (myHue).
+                    // cicla rosso→oro→verde; gli ALTRI pulsano tutti assieme.
+                    // Pixel a PIENA risoluzione (0-255) + luminosita' GLOBALE:
+                    // il dithering FastLED rende continuo il passaggio
+                    // minimo↔spento (niente scatto), come nel chill.
           bool steady[NUM_LEDS] = { false };
           for (uint8_t k = 0; k < sizeof(RASTA_STEADY); k++)
             if (RASTA_STEADY[k] >= 1 && RASTA_STEADY[k] <= NUM_LEDS)
               steady[RASTA_STEADY[k] - 1] = true;
           uint8_t ch  = RASTA_HUES[(now / RASTA_CYCLE_MS) % 3];
           float   bph = (float)(now % RASTA_BEAT_MS) / (float)RASTA_BEAT_MS * 2.0f * PI;
-          uint8_t bv  = (uint8_t)((0.5f - 0.5f * cosf(bph)) * maxV);  // 0→max→0
+          uint8_t bv  = (uint8_t)((0.5f - 0.5f * cosf(bph)) * 255.0f); // 0→255→0 continuo
           for (int i = 0; i < NUM_LEDS; i++)
-            leds[i] = steady[i] ? CHSV(ch, 255, maxV) : CHSV(myHue, 255, bv);
+            leds[i] = steady[i] ? CHSV(ch, 255, 255) : CHSV(myHue, 255, bv);
+          showBright = maxV;   // scala globale → dithering attivo, fissi restano a maxV
           break;
         }
       }
@@ -738,22 +760,24 @@ void renderLEDs() {
     }
   }
 
-  // ── FIRMA DEL CREATORE: aura dorata che ruota lenta (solo il tuo badge) ──
+  // ── FIRMA DEL CREATORE: aura dorata che percorre il contorno del badge ──
+  // Attiva in TUTTE le modalita' (overlay additivo dopo ogni animazione).
   if (IS_CREATOR) {
-    const uint32_t CREATOR_SPIN_MS = 400;   // ms per passo (alza = piu' lento)
-    const uint8_t  CREATOR_TRAIL   = 2;     // lunghezza scia (LED)
-    const uint8_t  CREATOR_PEAK    = 76;    // intensita' di picco (era 152, -50%)
-    uint8_t head = (uint8_t)((now / CREATOR_SPIN_MS) % NUM_LEDS);   // cometa dorata lenta
-    for (int i = 0; i < NUM_LEDS; i++) {
-      uint8_t d = (uint8_t)((i - head + NUM_LEDS) % NUM_LEDS);
-      uint8_t glow = (d < CREATOR_TRAIL)
-                   ? (uint8_t)(CREATOR_PEAK * (CREATOR_TRAIL - d) / CREATOR_TRAIL) : 0;
-      if (glow) {
-        CRGB g = CHSV(CREATOR_HUE, 230, glow);
-        leds[i].r = min(255, (int)leds[i].r + g.r);
-        leds[i].g = min(255, (int)leds[i].g + g.g);
-        leds[i].b = min(255, (int)leds[i].b + g.b);
-      }
+    static const uint8_t AURA_PATH[] = { 15,16,1,2,3,21,11,12,13,14 };  // giro (1-based)
+    const uint8_t  AURA_N      = sizeof(AURA_PATH);
+    const uint32_t AURA_LAP_MS = 2000;  // un giro completo in 2 secondi
+    const uint8_t  AURA_TRAIL  = 2;     // lunghezza scia (LED)
+    uint8_t head = (uint8_t)(((uint64_t)(now % AURA_LAP_MS)) * AURA_N / AURA_LAP_MS);
+    // Luminosita' finale dell'aura = MASSIMO della modalita' corrente (maxV),
+    // indipendente dall'animazione sotto. Se la brightness globale e' gia' la
+    // scala di modalita' (chill/rasta: showBright=maxV) il pixel va a 255;
+    // negli altri stati (showBright=255) il pixel va direttamente a maxV.
+    uint8_t auraV = (showBright == 255) ? maxV : 255;
+    for (uint8_t d = 0; d < AURA_TRAIL; d++) {
+      uint8_t p = AURA_PATH[(head + AURA_N - d) % AURA_N];
+      if (p < 1 || p > NUM_LEDS) continue;         // guardia per badge con meno LED
+      uint8_t v = (uint8_t)((uint16_t)auraV * (AURA_TRAIL - d) / AURA_TRAIL);
+      leds[p - 1] = CHSV(CREATOR_HUE, 230, v);     // SOSTITUISCE il colore del LED
     }
   }
 
@@ -991,7 +1015,7 @@ void loop() {
       for (uint8_t i = 0; i < nbCount; i++)
         if (neighbors[i].rssiFilt > bRssi) {
           bRssi = neighbors[i].rssiFilt;
-          bAge  = now - neighbors[i].lastSeen;
+          bAge  = ageMs(now, neighbors[i].lastSeen);
         }
       Serial.printf("  bestRssi=%d age=%lums", bRssi, (unsigned long)bAge);
     }
@@ -1000,18 +1024,18 @@ void loop() {
         (float)neighbors[partnerId].totalContactMs / (float)MATURITY_FULL_MS);
       // fase del partner estrapolata (come nel coupling) + differenza di fase
       uint8_t pnm  = (neighbors[partnerId].mood < 4) ? neighbors[partnerId].mood : 1;
-      float   pAge = (float)(now - neighbors[partnerId].lastSeen) / 1000.0f;
+      float   pAge = (float)ageMs(now, neighbors[partnerId].lastSeen) / 1000.0f;
       float   pSpd = dbgTogether ? TOGETHER_SPEED : MOOD_SPEED[pnm];
       float   nbPh = neighbors[partnerId].phase + OMEGA * pSpd * pAge;
       float   dPh  = nbPh - myPhase;
       while (dPh >  PI) dPh -= 2.0f * PI;
       while (dPh < -PI) dPh += 2.0f * PI;
       nbPh = fmodf(nbPh, 2.0f * PI); if (nbPh < 0) nbPh += 2.0f * PI;
-      bool fusing = (pairSessionMs >= FUSION_GRACE_MS);
+      uint32_t sess = neighbors[partnerId].sessionMs;
       Serial.printf("  → %08lx rssi=%d sess=%lus%s mat=%.1f%%  SYNC dPh=%+.2f  FUSIONE %d+%d=%d",
         (unsigned long)neighbors[partnerId].idHash,
         neighbors[partnerId].rssiFilt,
-        (unsigned long)(pairSessionMs / 1000), fusing ? ">fonde" : ">rodaggio",
+        (unsigned long)(sess / 1000), (sess >= FUSION_GRACE_MS) ? ">fonde" : ">rodaggio",
         mat * 100.0f,
         dPh,
         myHue, neighbors[partnerId].hue, dbgShowHue);
