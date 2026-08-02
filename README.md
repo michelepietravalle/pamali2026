@@ -1,1 +1,1 @@
-<img width="1054" height="1492" alt="Volantino" src="https://github.com/user-attachments/assets/0bb22497-1e46-4da4-9b9b-7e68e88bfe61" />
+<img width="1024" height="1536" alt="volantino" src="https://github.com/user-attachments/assets/c4327ba6-6b9d-494e-a9fd-cb9dee8c1aa6" />
